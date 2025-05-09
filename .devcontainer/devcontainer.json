@@ -1,0 +1,24 @@
+{
+  "name": "My Windsurf Dev Container",
+  //"image": "mcr.microsoft.com/vscode/devcontainers/base:ubuntu",  // ベースイメージ
+  //"image": "cfml_book:latest",
+  "build": {
+    "dockerfile": "../Dockerfile",   // .devcontainer/Dockerfile を使う場合は "./.devcontainer/Dockerfile"
+    "context": ".."                // プロジェクトルートをビルドコンテキストに
+  },
+  "features": {
+    "docker-in-docker": "latest"                                  // Docker-in-Docker有効化
+  },
+  "workspaceFolder": "/workspaces/cfml_book",
+  "postCreateCommand": "mkdir -p /workspaces/cfml_book",
+  "remoteUser": "root",                                         // ユーザ設定
+  //"containerEnv": {
+  "remoteEnv": {
+    "XDG_RUNTIME_DIR": "/tmp"      // <- ここで上書き
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-azuretools.vscode-docker"]               // Docker拡張
+    }
+  }
+}
