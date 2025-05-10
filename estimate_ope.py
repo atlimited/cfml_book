@@ -1,7 +1,11 @@
+from pprint import pprint
+from typing import Optional
+import numpy as np
+import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from obp.dataset import SyntheticBanditDataset, logistic_reward_function, linear_behavior_policy
-from obp.policy import IPWLearner
+from obp.policy import IPWLearner, QLearner, Random
 from obp.ope import OffPolicyEvaluation, RegressionModel
 from obp.ope import InverseProbabilityWeighting as IPW
 from obp.ope import DirectMethod as DM
@@ -10,11 +14,104 @@ from obp.ope import SelfNormalizedInverseProbabilityWeighting as SNIPW
 from obp.ope import SwitchDoublyRobust as SwitchDR
 from obp.ope import DoublyRobustTuning, SelfNormalizedDoublyRobust, SwitchDoublyRobustTuning, DoublyRobustWithShrinkageTuning
 
-import numpy as np
 from obp.utils import softmax
 from obp.utils import sample_action_fast
+from obp.utils import convert_to_action_dist
 
-from typing import Optional
+def action_to_action_dist(n_actions, action):
+    nested_action = np.array([[x] for x in action], dtype=int)
+    return convert_to_action_dist(n_actions, nested_action)
+
+def analysis_bandit_feedback(bandit_feedback, dataset):
+    seed = 42
+    total_size = bandit_feedback['n_rounds']
+    base_prob = bandit_feedback["expected_reward"][:,0]
+    treat_prob = bandit_feedback["expected_reward"][:,1]
+    np.random.seed(seed + 1)
+    y0 = (np.random.random(total_size) < base_prob).astype(int)
+    np.random.seed(seed + 2)
+    y1 = (np.random.random(total_size) < treat_prob).astype(int)
+
+    total_control_mask = bandit_feedback["action"] == 0
+    total_control_size = np.sum(total_control_mask)
+    total_control_conversion = np.sum(bandit_feedback["reward"][total_control_mask])
+    total_control_rate = total_control_conversion / total_control_size
+
+    total_treatment_mask = bandit_feedback["action"] == 1
+    total_treatment_size = np.sum(total_treatment_mask)
+    total_treatment_conversion = np.sum(bandit_feedback["reward"][total_treatment_mask])
+    total_treatment_rate = total_treatment_conversion / total_treatment_size
+
+    #ate = np.mean(bandit_feedback["y1"]) - np.mean(bandit_feedback["y0"])
+    ate = np.mean(y1) - np.mean(y0)
+    random_policy_value = np.mean(y0) + 0.5 * ate
+    avg_reward = np.mean(bandit_feedback["reward"])
+
+    print(f"全体(サイズ: {total_size}, ATE: {ate}, random_policy_value: {random_policy_value}):")
+    print(f"  総トリートメント数={total_treatment_size}")
+    print(f"  平均報酬={avg_reward}")
+    print(f"  コントロール反応率={total_control_rate:.4f} ({total_control_conversion}/{total_control_size})")
+    print(f"  トリートメント反応率={total_treatment_rate:.4f} ({total_treatment_conversion}/{total_treatment_size})")
+    print(f"  観測されたリフト={total_treatment_rate-total_control_rate:.4f}")
+
+    #original_action_dist = np.array([[[1],[0]] if a == 0 else [[0],[1]] for a in bandit_feedback["action"]])
+    original_action_dist = action_to_action_dist(bandit_feedback["n_actions"], bandit_feedback["action"])
+    original_ground_truth_policy_value = dataset.calc_ground_truth_policy_value(
+        expected_reward=bandit_feedback["expected_reward"],
+        action_dist=original_action_dist
+    )
+    #print(original_action_dist)
+    #print(bandit_feedback["expected_reward"])
+    print("元の真の方策価値:", original_ground_truth_policy_value)
+
+    random_action = np.zeros(total_size)
+
+    # ランダムに2000個のインデックスを選択
+    #random_indices = np.random.choice(total_size, size=total_treatment_size, replace=False)
+    random_indices = np.random.choice(total_size, size=int(total_size / 2), replace=False)
+
+    # 選択したインデックスの位置に1を設定
+    random_action[random_indices] = 1
+
+    #random_action_dist = np.array([[[1],[0]] if a == 0 else [[0],[1]] for a in random_action])
+    random_action_dist = action_to_action_dist(bandit_feedback["n_actions"], random_action)
+    random_ground_truth_policy_value = dataset.calc_ground_truth_policy_value(
+        expected_reward=bandit_feedback["expected_reward"],
+        action_dist=random_action_dist
+    )
+    print("ランダム方策の方策価値:", random_ground_truth_policy_value)
+    print("")
+
+def bandit_feedback2df(bandit_feedback):
+    df = pd.DataFrame(bandit_feedback["context"], columns=["age", "homeown"])
+    df["action"] = bandit_feedback["action"]
+    df["reward"] = bandit_feedback["reward"]
+    df["base_prob"] = bandit_feedback["expected_reward"][:,0]
+    df["treat_prob"] = bandit_feedback["expected_reward"][:,1]
+    df["pscore"] = bandit_feedback["pscore"]
+    return df
+
+def random_behavior_policy(context, action_context, random_state=None):
+    """Function that returns uniform logits (mimicking Random policy)"""
+    n_rounds = context.shape[0]
+    n_actions = action_context.shape[0]
+    # Return uniform logits (all zeros)
+    return np.zeros((n_rounds, n_actions))
+
+def ql_behavior_policy(context, action_context, random_state=None):
+    """Wrapper function to use a trained QLearner as a behavior policy function"""
+    # Use the trained eval_policy to predict scores
+    q_hat = eval_policy.predict_score(context=context)
+
+    # Return the scores as logits
+    # Note: We're not converting to probabilities here as SyntheticBanditDataset
+    # will apply softmax internally
+    if q_hat.ndim > 2:
+        q_hat = q_hat.mean(axis=2)  # Average across positions
+
+    print(q_hat)
+    return q_hat
+    #return np.array([[x[1], x[0]] for x in q_hat])
 
 
 class CustomContextBanditDataset(SyntheticBanditDataset):
@@ -345,6 +442,7 @@ class GroupBasedBanditDataset(SyntheticBanditDataset):
         """
         # 1. 特徴量の生成
         np.random.seed(self.seed)
+        print(self.seed)
         N = n_rounds
         age = np.random.randint(20, 81, size=N)
         homeown = np.random.binomial(1, 0.6, size=N)
@@ -378,9 +476,29 @@ class GroupBasedBanditDataset(SyntheticBanditDataset):
         response_group[(response_group == 0)] = 4
 
         # 3. 行動方策の計算（傾向スコア）
-        # 年齢と持ち家状況に基づいて傾向スコアを計算
-        logit_ps = -8 + 0.1 * age + 1.0 * homeown
-        ps = 1 / (1 + np.exp(-logit_ps))
+        ## 年齢と持ち家状況に基づいて傾向スコアを計算
+        #logit_ps = -8 + 0.1 * age + 1.0 * homeown
+        #ps = 1 / (1 + np.exp(-logit_ps))
+        #ps = np.random.random(size=N)
+
+        # Calculate behavior policy logits
+        if self.behavior_policy_function is None:
+            pi_b_logits = self.calc_expected_reward(contexts)
+        else:
+            pi_b_logits = self.behavior_policy_function(
+                context = contexts,
+                action_context = self.action_context,
+                random_state=self.random_state,
+            )
+
+        # Calculate propensity scores
+        pi_b = softmax(self.beta * pi_b_logits)
+
+        # Extract propensity scores for action 1 (treatment)
+        ps = pi_b[:, 1] if pi_b.shape[1] > 1 else pi_b[:, 0]
+
+        print("ps")
+        print(ps)
 
         # 4. 処置割り当て
         np.random.seed(self.seed)
@@ -434,8 +552,16 @@ class GroupBasedBanditDataset(SyntheticBanditDataset):
         outcome = np.where(treatment == 1, y1, y0)
 
         # 8. OBPのバンディットフィードバック形式に変換
+        #random_action = np.zeros(N, dtype=int)
+        ##random_indices = np.random.choice(total_size, size=total_treatment_size, replace=False)
+        #random_indices = np.random.choice(N, size=int(N / 2), replace=False)
+        ## 選択したインデックスの位置に1を設定
+        #random_action[random_indices] = 1
+
+        #actions = random_action
         # アクションをOBP形式に変換（0/1）
         actions = treatment
+
 
         # 報酬をアウトカムとして設定
         rewards = outcome
@@ -452,6 +578,9 @@ class GroupBasedBanditDataset(SyntheticBanditDataset):
 
         # propensity score（選択されたアクションの確率）
         pscore = pi_b[np.arange(N), actions]
+
+        # train/testで別のデータを生成したいため、シードをインクリメント
+        self.seed += 1
 
         # 追加情報を含めたバンディットフィードバックを返す
         return dict(
@@ -530,70 +659,23 @@ dim_context = 2  # コンテキスト（ユーザー特徴量など）の次元�
 dataset = GroupBasedBanditDataset(
     n_actions=2,  # 処置あり/なしの2値
     dim_context=2,  # 年齢と持ち家の2次元
+    behavior_policy_function=random_behavior_policy,
     seed=12345
 )
 
 
 # トレーニングデータとテストデータを生成
-bandit_feedback_train = dataset.obtain_batch_bandit_feedback(n_rounds=10000)
+bandit_feedback_train = dataset.obtain_batch_bandit_feedback(n_rounds=100000)
 bandit_feedback_test = dataset.obtain_batch_bandit_feedback(n_rounds=10000)
 
 ## 全体の反応率
-bandit_feedback = bandit_feedback_test
+#bandit_feedback = bandit_feedback_test
 
-seed = 42
-total_size = bandit_feedback['n_rounds']
-base_prob = bandit_feedback["expected_reward"][:,0]
-treat_prob = bandit_feedback["expected_reward"][:,1]
-np.random.seed(seed + 1)
-y0 = (np.random.random(total_size) < base_prob).astype(int)
-np.random.seed(seed + 2)
-y1 = (np.random.random(total_size) < treat_prob).astype(int)
 
-total_control_mask = bandit_feedback["action"] == 0
-total_control_size = np.sum(total_control_mask)
-total_control_conversion = np.sum(bandit_feedback["reward"][total_control_mask])
-total_control_rate = total_control_conversion / total_control_size
-
-total_treatment_mask = bandit_feedback["action"] == 1
-total_treatment_size = np.sum(total_treatment_mask)
-total_treatment_conversion = np.sum(bandit_feedback["reward"][total_treatment_mask])
-total_treatment_rate = total_treatment_conversion / total_treatment_size
-
-#ate = np.mean(bandit_feedback["y1"]) - np.mean(bandit_feedback["y0"])
-ate = np.mean(y1) - np.mean(y0)
-random_policy_value = np.mean(y0) + 0.5 * ate
-
-print(f"全体(サイズ: {total_size}, ATE: {ate}), random_policy_value: {random_policy_value}:")
-print(f"  総トリートメント数={total_treatment_size}")
-print(f"  コントロール反応率={total_control_rate:.4f} ({total_control_conversion}/{total_control_size})")
-print(f"  トリートメント反応率={total_treatment_rate:.4f} ({total_treatment_conversion}/{total_treatment_size})")
-print(f"  観測されたリフト={total_treatment_rate-total_control_rate:.4f}")
-
-original_action_dist = np.array([[[1],[0]] if a == 1 else [[0],[1]] for a in bandit_feedback["action"]])
-original_ground_truth_policy_value = dataset.calc_ground_truth_policy_value(
-    expected_reward=bandit_feedback["expected_reward"],
-    action_dist=original_action_dist
-)
-print("元の真の方策価値:", original_ground_truth_policy_value)
-
-random_action = np.zeros(total_size)
-
-# ランダムに2000個のインデックスを選択
-#random_indices = np.random.choice(total_size, size=total_treatment_size, replace=False)
-random_indices = np.random.choice(total_size, size=int(total_size / 2), replace=False)
-
-# 選択したインデックスの位置に1を設定
-random_action[random_indices] = 1
-
-random_action_dist = np.array([[[1],[0]] if a == 1 else [[0],[1]] for a in random_action])
-random_ground_truth_policy_value = dataset.calc_ground_truth_policy_value(
-    expected_reward=bandit_feedback["expected_reward"],
-    action_dist=random_action_dist
-)
-print("ランダム方策の方策価値:", random_ground_truth_policy_value)
-
-print("")
+print("train")
+analysis_bandit_feedback(bandit_feedback_train, dataset)
+print("test")
+analysis_bandit_feedback(bandit_feedback_test, dataset)
 
 ## バンディットフィードバックデータの生成
 ##bandit_feedback = dataset.obtain_batch_bandit_feedback(n_rounds=10000)
@@ -634,20 +716,26 @@ print("")
 #    print()
 
 
-
 # 2. 評価方策の定義と学習
-eval_policy = IPWLearner(
+#eval_policy = IPWLearner(
+#    n_actions=dataset.n_actions,
+#    #base_classifier=LogisticRegression()
+#    base_classifier=RandomForestClassifier()
+#)
+
+eval_policy = QLearner(
     n_actions=dataset.n_actions,
-    base_classifier=LogisticRegression()
+    #base_model=LogisticRegression()
+    base_model=RandomForestClassifier()
 )
+
 eval_policy.fit(
     context=bandit_feedback_train["context"],
     action=bandit_feedback_train["action"],
     reward=bandit_feedback_train["reward"],
     pscore=bandit_feedback_train["pscore"]
 )
-action_dist = eval_policy.predict(context=bandit_feedback_test["context"])
-#action_dist = random_action_dist
+action_dist = eval_policy.predict(context=bandit_feedback_test["context"]) #action_dist = random_action_dist
 
 ## 確認
 #product = (action_dist.squeeze(axis=2) * bandit_feedback["expected_reward"])
@@ -673,7 +761,7 @@ action_dist = eval_policy.predict(context=bandit_feedback_test["context"])
 #    ),
 #)
 
-# ランダムフォレsと
+# ランダムフォレスト
 regression_model = RegressionModel(
     n_actions=dataset.n_actions,
     base_model=RandomForestClassifier(
@@ -741,14 +829,18 @@ estimated_policy_values = ope.estimate_policy_values(
     action_dist=action_dist,
     estimated_rewards_by_reg_model=estimated_rewards_by_reg_model,
 )
-print("推定された方策価値:", estimated_policy_values)
+print("推定された方策価値:")
+pprint(estimated_policy_values)
+print("")
 
 # 5. 真の方策価値との比較
 ground_truth_policy_value = dataset.calc_ground_truth_policy_value(
     expected_reward=bandit_feedback_test["expected_reward"],
     action_dist=action_dist
 )
+
 print("真の方策価値:", ground_truth_policy_value)
+print("")
 
 # OPE手法の性能評価
 ope_performance = ope.evaluate_performance_of_estimators(
@@ -757,10 +849,44 @@ ope_performance = ope.evaluate_performance_of_estimators(
     estimated_rewards_by_reg_model=estimated_rewards_by_reg_model,
     metric="se"  # 二乗誤差を使用
 )
-print("OPE手法の性能評価 (SE):", ope_performance)
+print("OPE手法の性能評価 (SE):")
+pprint(ope_performance)
 
 ## 結果の可視化
 #ope.visualize_off_policy_estimates(
 #    action_dist=action_dist,
 #    estimated_rewards_by_reg_model=estimated_rewards_by_reg_model,
 #)
+
+
+dataset2 = GroupBasedBanditDataset(
+    n_actions=2,  # 処置あり/なしの2値
+    dim_context=2,  # 年齢と持ち家の2次元
+    behavior_policy_function=ql_behavior_policy,
+    #behavior_policy_function=None,
+    seed=12345
+)
+
+
+# トレーニングデータとテストデータを生成
+bandit_feedback2_train = dataset2.obtain_batch_bandit_feedback(n_rounds=10000)
+bandit_feedback2_test = dataset2.obtain_batch_bandit_feedback(n_rounds=10000)
+
+df = bandit_feedback2df(bandit_feedback2_train)
+print(df)
+print(df[df["action"] == 1]["treat_prob"].sum())
+print(df[df["action"] == 0]["base_prob"].sum())
+print(df[df["action"] == 1]["treat_prob"].mean())
+print(df[df["action"] == 0]["base_prob"].mean())
+analysis_bandit_feedback(bandit_feedback2_train, dataset2)
+#analysis_bandit_feedback(bandit_feedback2_test)
+
+#original_action_dist = np.array([[[1],[0]] if a == 0 else [[0],[1]] for a in bandit_feedback2_train["action"]])
+#original_ground_truth_policy_value = dataset2.calc_ground_truth_policy_value(
+#    expected_reward=bandit_feedback2_train["expected_reward"],
+#    action_dist=original_action_dist
+#)
+#print(original_action_dist)
+#print(bandit_feedback2_train["expected_reward"])
+#print("元の真の方策価値:", original_ground_truth_policy_value)
+
